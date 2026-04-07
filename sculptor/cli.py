@@ -20,7 +20,7 @@ from rich.table import Table
 from .config import load_config, validate_config
 from .llm_client import LLMClient
 from .openbrush_client import OpenBrushClient, OpenBrushError
-from .planner import Planner
+from .planner import StagedPlanner
 from .executor import Executor
 
 
@@ -42,12 +42,15 @@ HELP_TEXT = """
   [bold green]/redo[/]      — Redo last action
   [bold green]/status[/]    — Check Open Brush connection
   [bold green]/refine[/]    — Refine the last artwork (e.g., /refine make it bigger)
-  [bold green]/reset[/]     — Reset conversation history
+  [bold green]/reset[/]     — Reset session memory and conversation history
   [bold green]/help[/]      — Show this help
   [bold green]/quit[/]      — Exit
 
 [bold cyan]Usage:[/]
-  Just type what you want to create! Examples:
+  Just type what you want to create! The agent runs 4 stages automatically:
+  [bold]💡 Ideas → ✏️ Sketch → 🖼️ Overall → ✨ Details[/]
+
+  Examples:
   • [italic]"draw a glowing spiral tower"[/]
   • [italic]"create a fractal tree with autumn colors"[/]
   • [italic]"make a wireframe sphere with orbiting rings"[/]
@@ -117,13 +120,7 @@ def run_cli(config_path: str | None = None):
     llm_config = config.get("llm", {})
     ob_config = config.get("openbrush", {})
 
-    llm = LLMClient(
-        api_key=llm_config.get("api_key", ""),
-        base_url=llm_config.get("base_url", "https://api.openai.com/v1"),
-        model=llm_config.get("model", "gpt-4o"),
-        temperature=llm_config.get("temperature", 0.7),
-        max_tokens=llm_config.get("max_tokens", 4096),
-    )
+    llm = _create_llm_client(llm_config)
 
     ob_client = OpenBrushClient(
         host=ob_config.get("host", "localhost"),
@@ -131,7 +128,7 @@ def run_cli(config_path: str | None = None):
         command_delay=ob_config.get("command_delay", 0.05),
     )
 
-    planner = Planner(llm)
+    planner = StagedPlanner(llm)
 
     console.print("[bold]Checking connections...[/]")
     console.print(f"  [dim]LLM: {llm_config.get('base_url')} ({llm_config.get('model')})[/]")
@@ -246,44 +243,68 @@ def run_cli(config_path: str | None = None):
 
             continue
 
-        # ── Generate and execute art plan ──────────────────────
-        with console.status("[bold cyan]🧠 Thinking...[/]"):
-            try:
-                plan = planner.plan(user_input)
-            except Exception as e:
-                console.print(f"[red]✗ LLM Error:[/] {e}")
-                continue
-
-        display_plan(plan)
-
-        # Ask for confirmation
-        confirm = Prompt.ask("Execute this plan?", choices=["y", "n", "r"], default="y")
+        # ── Generate and execute art plan (4-stage auto-chain) ────
+        confirm = Prompt.ask(
+            "\n[bold cyan]🚀 Run 4-stage pipeline?[/] (💡ideas → ✏️sketch → 🖼️overall → ✨details)",
+            choices=["y", "n"],
+            default="y",
+        )
         if confirm == "n":
-            console.print("[dim]Plan cancelled.[/]")
+            console.print("[dim]Cancelled.[/]")
             continue
-        elif confirm == "r":
-            # Regenerate
-            with console.status("[bold cyan]🧠 Regenerating...[/]"):
-                try:
-                    planner.conversation_history = planner.conversation_history[:-2]  # Remove last exchange
-                    plan = planner.plan(user_input)
-                except Exception as e:
-                    console.print(f"[red]✗ LLM Error:[/] {e}")
-                    continue
-            display_plan(plan)
-            confirm2 = Prompt.ask("Execute this plan?", choices=["y", "n"], default="y")
-            if confirm2 == "n":
-                continue
 
         if sys.platform == "darwin":
             console.print("\n[bold yellow]👉 Quick! Click the Open Brush window to ensure it doesn't pause![/]")
             for i in range(3, 0, -1):
                 console.print(f"[dim]Starting in {i}...[/]", end="\r")
                 time.sleep(1)
-            console.print(" " * 20, end="\r") # Clear line
+            console.print(" " * 20, end="\r")
 
-        _execute_plan(plan, ob_client, config)
-        last_plan = plan
+        # Stage 1 — Ideas
+        console.print("\n[bold cyan]💡 Stage 1 — Ideation...[/]")
+        with console.status("[dim]Thinking...[/]"):
+            try:
+                concept = planner.stage1_ideate(user_input)
+            except Exception as e:
+                console.print(f"[red]✗ Stage 1 Error:[/] {e}")
+                continue
+        console.print(Panel(concept, title="💡 Concept Brief", border_style="cyan", padding=(1, 2)))
+
+        # Stage 2 — Sketch
+        console.print("\n[bold cyan]✏️  Stage 2 — Rough Sketch...[/]")
+        with console.status("[dim]Blocking...[/]"):
+            try:
+                sketch_plan = planner.stage2_sketch()
+            except Exception as e:
+                console.print(f"[red]✗ Stage 2 Error:[/] {e}")
+                continue
+        display_plan(sketch_plan)
+        _execute_plan(sketch_plan, ob_client, config, stage_label="✏️  Sketch")
+
+        # Stage 3 — Overall
+        console.print("\n[bold cyan]🖼️  Stage 3 — Overall Drawing...[/]")
+        with console.status("[dim]Composing...[/]"):
+            try:
+                overall_plan = planner.stage3_overall()
+            except Exception as e:
+                console.print(f"[red]✗ Stage 3 Error:[/] {e}")
+                continue
+        display_plan(overall_plan)
+        _execute_plan(overall_plan, ob_client, config, stage_label="🖼️  Overall")
+
+        # Stage 4 — Details
+        console.print("\n[bold cyan]✨ Stage 4 — Detail Pass...[/]")
+        with console.status("[dim]Polishing...[/]"):
+            try:
+                details_plan = planner.stage4_details()
+            except Exception as e:
+                console.print(f"[red]✗ Stage 4 Error:[/] {e}")
+                continue
+        display_plan(details_plan)
+        _execute_plan(details_plan, ob_client, config, stage_label="✨ Details")
+
+        last_plan = details_plan
+        console.print("\n[bold green]🎉 Pipeline complete![/]")
 
         export_config = config.get("export", {})
         if export_config.get("auto_save"):
@@ -304,17 +325,17 @@ def _handle_export_and_copy(ob_client: OpenBrushClient, wait_time: int = 5):
         console.print(f"  [dim]Exporting model. Waiting {wait_time}s for Open Brush to generate file...[/]")
         ob_client.export_current()
         time.sleep(wait_time)
-        
+
         exports_dir = Path.home() / "Documents/Open Brush/Exports"
         results_dir = Path("results")
         results_dir.mkdir(exist_ok=True)
-        
+
         if exports_dir.exists():
             items = list(exports_dir.glob("*"))
             if not items:
                 console.print("  [yellow]⚠ Export folder is empty! Open Brush might still be generating it.[/yellow]")
                 return
-                
+
             newest = max(items, key=os.path.getmtime)
             dest = results_dir / newest.name
             if newest.is_dir():
@@ -323,14 +344,14 @@ def _handle_export_and_copy(ob_client: OpenBrushClient, wait_time: int = 5):
             else:
                 shutil.copy2(newest, dest)
             console.print(f"  [green]✓[/] Exported and saved to: [cyan]{dest}[/cyan]")
-            
+
             # Automatically convert JSON to OBJ if JSON exists
             try:
                 sys.path.append(str(Path(__file__).parent.parent))
                 from json_to_obj import convert_json_to_obj
                 json_files = list(dest.rglob("*.json")) if dest.is_dir() else ([dest] if dest.suffix == ".json" else [])
                 main_jsons = [jf for jf in json_files if not jf.name.endswith(".metadata.json")]
-                
+
                 for jf in main_jsons:
                     out_obj = jf.with_suffix(".obj")
                     if not out_obj.exists():
@@ -348,10 +369,10 @@ def _handle_export_and_copy(ob_client: OpenBrushClient, wait_time: int = 5):
         console.print(f"  [red]⚠ Export processing error: {e}[/red]")
 
 
-def _execute_plan(plan, ob_client: OpenBrushClient, config: dict):
+def _execute_plan(plan, ob_client: OpenBrushClient, config: dict, stage_label: str = ""):
     """Execute a plan with progress display."""
     total = len(plan.steps)
-
+    label = f"{stage_label} — Executing" if stage_label else "Executing"
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -359,7 +380,7 @@ def _execute_plan(plan, ob_client: OpenBrushClient, config: dict):
         TextColumn("{task.completed}/{task.total}"),
         console=console,
     ) as progress:
-        task = progress.add_task("Executing...", total=total)
+        task = progress.add_task(label, total=total)
 
         def on_step(i, total, desc):
             progress.update(task, completed=i, description=f"[cyan]{desc}[/]")
@@ -438,13 +459,7 @@ def main():
         llm_config = config.get("llm", {})
         ob_config = config.get("openbrush", {})
 
-        llm = LLMClient(
-            api_key=llm_config.get("api_key", ""),
-            base_url=llm_config.get("base_url", "https://api.openai.com/v1"),
-            model=llm_config.get("model", "gpt-4o"),
-            temperature=llm_config.get("temperature", 0.7),
-            max_tokens=llm_config.get("max_tokens", 4096),
-        )
+        llm = _create_llm_client(llm_config)
 
         ob_client = OpenBrushClient(
             host=ob_config.get("host", "localhost"),
@@ -452,21 +467,30 @@ def main():
             command_delay=ob_config.get("command_delay", 0.05),
         )
 
-        planner = Planner(llm)
-        plan = planner.plan(args.prompt)
+        planner = StagedPlanner(llm)
+        # Non-interactive mode: run full 4-stage pipeline silently
+        try:
+            concept, sketch, overall, details = planner.run_pipeline(args.prompt)
+        except Exception as e:
+            console.print(f"[red]✗ Pipeline Error:[/] {e}")
+            sys.exit(1)
 
-        console.print(f"\n🎨 {plan.title}: {plan.description}")
+        console.print(f"\n🎨 {details.title}: {details.description}")
 
         def on_step(i, total, desc):
             console.print(f"  [{i+1}/{total}] {desc}")
 
-        executor = Executor(ob_client, on_step=on_step)
-        results = executor.execute(plan)
-
-        console.print(f"\n✓ Done: {results['completed']}/{results['total_steps']} steps, {results['paths_drawn']} paths drawn")
-        if results["errors"]:
-            for err in results["errors"]:
-                console.print(f"  ⚠ {err}")
+        for stage_plan, label in [
+            (sketch, "Sketch"),
+            (overall, "Overall"),
+            (details, "Details"),
+        ]:
+            executor = Executor(ob_client, on_step=on_step)
+            results = executor.execute(stage_plan)
+            console.print(f"  [{label}] ✓ {results['completed']}/{results['total_steps']} steps, {results['paths_drawn']} paths drawn")
+            if results["errors"]:
+                for err in results["errors"]:
+                    console.print(f"    ⚠ {err}")
 
         export_config = config.get("export", {})
         if export_config.get("auto_save"):
@@ -475,10 +499,23 @@ def main():
         if export_config.get("auto_export"):
             _handle_export_and_copy(ob_client, wait_time=5)
 
-        if results["errors"]:
+        if any(results.get("errors") for results in []):
             sys.exit(1)
     else:
         run_cli(args.config)
+
+
+def _create_llm_client(llm_config: dict) -> LLMClient:
+    """Create an LLM client from config with optional throttling settings."""
+    return LLMClient(
+        api_key=llm_config.get("api_key", ""),
+        base_url=llm_config.get("base_url", "https://api.openai.com/v1"),
+        model=llm_config.get("model", "gpt-4o"),
+        temperature=llm_config.get("temperature", 0.7),
+        max_tokens=llm_config.get("max_tokens", 4096),
+        call_delay=llm_config.get("call_delay"),
+        requests_per_minute=llm_config.get("requests_per_minute"),
+    )
 
 
 if __name__ == "__main__":

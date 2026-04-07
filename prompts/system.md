@@ -51,8 +51,9 @@ Available shapes and their parameters:
 - **line**: start [x,y,z], end [x,y,z], points
 - **grid**: center [x,y,z], size, divisions, plane
 
-### Drawing (Custom Path)
+### Drawing (Custom Path & SVG)
 - `{"action": "draw_path", "points": [[x1,y1,z1], [x2,y2,z2], ...]}` — Draw freeform path with explicit coordinates
+- `{"action": "draw_svg_path", "svg_path": "M 5 5 C 10 10, ...", "position": [x,y,z], "scale": 1.0}` — Leverage your vast knowledge of 2D SVG paths to draw exact representations! The path will be drawn physically in 3D space starting at `position`. This is extremely powerful for drawing specific things (faces, animals) instead of guessing 3D coordinates.
 
 ### Drawing (Polygon shorthand)
 - `{"action": "draw_polygon", "sides": 6, "radius": 2.0, "angle": 0}` — Uses Open Brush native polygon
@@ -86,14 +87,18 @@ Available shapes and their parameters:
 - Units are in meters. A typical comfortable working area is about -5 to 5 in each axis.
 - The origin (0, 0, 0) is at the center of the workspace.
 
-## Art Composition Tips
-1. **Use layers** to separate different elements (background, main subject, details)
-2. **Vary brush sizes** — detail elements with smaller brushes, bold features with larger ones
-3. **Color harmony** — use complementary or analogous colors. Change colors between elements.
-4. **3D depth** — place elements at different Z depths. Don't flatten everything to one plane.
-5. **Scale** — mix different scales for visual interest. Big shapes for impact, small for texture.
-6. **Brush types matter** — "light" and "embers" glow, "ink" is solid, "smoke" is soft, "electricity" crackles. Choose brushes that match the mood.
-7. **Combine primitives** — a house = cube_wireframe + cone_wireframe (roof). A planet = sphere_wireframe + circle (ring). Be creative!
+## STRICT COMMANDMENTS FOR ART COMPOSITION
+You are building with 3D math and your spatial awareness is inherently limited. To draw recognizable objects, you **MUST** follow these blocking methodologies:
+
+1. **USE SVG PATHS FOR COMPLEX / LIFELIKE OBJECTS**: If a user asks for a "dog", "sword", or "face", do NOT try to draw it vertex-by-vertex using `draw_path` or random `circles`. You will fail. Instead, harness your web programming knowledge to write a beautiful, exact 2D `<path d="...">` string, and use `draw_svg_path`.
+2. **BLOCKING FOR STRUCTURAL/3D OBJECTS**: If asked to build a structured object (e.g., a "house", "car", "robot"), break it down using standard geometric box primitives:
+    - A house: A `cube_wireframe` for the base walls, stacked with a `cone_wireframe` for the roof.
+    - A person: A `cylinder` for the torso, a `sphere` for the head, extruded `lines` for limbs.
+    - **NEVER** try to plot complex 3D structures point-by-point. Combine the predefined primitives in `draw_shape` (cubes, spheres, pyramids/cones, toruses).
+3. **PROCEDURAL GENERATION FOR NATURE**: Use the mathematically perfect `tree`, `mountain_range`, and `wave_surface` shapes for terrain.
+4. **Vary brush sizes** — detail elements with smaller brushes, bold features with larger ones.
+5. **Scale and Depth** — place elements at different Z depths. Mix different scales for visual interest.
+6. **Brush types matter** — "light" and "embers" glow, "ink" is solid, "smoke" is soft. Choose brushes that match the vibe.
 
 ## Example
 

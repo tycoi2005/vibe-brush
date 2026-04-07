@@ -3,11 +3,14 @@
 
 # LLM Settings (OpenAI-compatible API)
 llm:
-  api_key: "sk-your-api-key-here"          # or set OPENAI_API_KEY env var
-  base_url: "https://api.openai.com/v1"    # or any OpenAI-compatible endpoint
-  model: "gpt-4o"                           # model name
+  api_key: ""                               # set OLLAMA_API_KEY (recommended) or OPENAI_API_KEY
+  base_url: "https://ollama.com/v1"        # Ollama Cloud OpenAI-compatible endpoint
+  model: "glm-5"                            # model name
   temperature: 0.7                          # creativity (0.0 = precise, 1.0 = creative)
   max_tokens: 4096                          # max response tokens
+  # Optional throttling settings (use one or both):
+  requests_per_minute: 5                    # -> auto delay of 12s between calls
+  # call_delay: 12.0                        # explicit delay override in seconds
 
 # Open Brush Connection
 openbrush:

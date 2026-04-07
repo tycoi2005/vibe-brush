@@ -17,6 +17,8 @@ DEFAULT_CONFIG = {
         "model": "gpt-4o",
         "temperature": 0.7,
         "max_tokens": 4096,
+        "call_delay": None,
+        "requests_per_minute": None,
     },
     "openbrush": {
         "host": "localhost",
@@ -51,9 +53,12 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     4. ~/.config/sculptor/config.yaml
 
     Environment variable overrides:
+    - OLLAMA_API_KEY -> llm.api_key
     - OPENAI_API_KEY -> llm.api_key
     - OPENAI_BASE_URL -> llm.base_url
     - OPENAI_MODEL -> llm.model
+    - OPENAI_CALL_DELAY -> llm.call_delay
+    - OPENAI_REQUESTS_PER_MINUTE -> llm.requests_per_minute
     - OPENBRUSH_HOST -> openbrush.host
     - OPENBRUSH_PORT -> openbrush.port
     """
@@ -83,9 +88,12 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
 
     # Environment variable overrides
     env_overrides = {
+        "OLLAMA_API_KEY": ("llm", "api_key"),
         "OPENAI_API_KEY": ("llm", "api_key"),
         "OPENAI_BASE_URL": ("llm", "base_url"),
         "OPENAI_MODEL": ("llm", "model"),
+        "OPENAI_CALL_DELAY": ("llm", "call_delay"),
+        "OPENAI_REQUESTS_PER_MINUTE": ("llm", "requests_per_minute"),
         "OPENBRUSH_HOST": ("openbrush", "host"),
         "OPENBRUSH_PORT": ("openbrush", "port"),
     }
@@ -96,9 +104,11 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
             section, key = key_path
             if section not in config:
                 config[section] = {}
-            # Convert port to int
+            # Convert numeric fields
             if key == "port":
                 value = int(value)
+            elif key in ("call_delay", "requests_per_minute"):
+                value = float(value)
             config[section][key] = value
 
     return config

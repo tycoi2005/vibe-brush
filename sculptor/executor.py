@@ -133,6 +133,19 @@ class Executor:
             self.client.draw_text(step.get("text", ""))
             paths_drawn = 1
 
+        elif action == "draw_svg_path":
+            svg_path = step.get("svg_path", "")
+            pos = step.get("position", [0, 0, 0])
+            # depth_slices: how many Z-depth copies to draw (default 1 = flat)
+            depth_slices = int(step.get("depth_slices", 1))
+            depth_spacing = float(step.get("depth_spacing", 0.5))
+
+            for slice_idx in range(depth_slices):
+                z = float(pos[2]) + slice_idx * depth_spacing
+                self.client.move_brush_to(float(pos[0]), float(pos[1]), z)
+                self.client.draw_svg_path(svg_path)
+                paths_drawn += 1
+
         # ── Brush Position ─────────────────────────────────────
         elif action == "move_to":
             pos = step.get("position", [0, 0, 0])
@@ -242,6 +255,10 @@ class Executor:
             return f"Draw {step.get('sides', '?')}-sided polygon"
         elif action == "draw_text":
             return f"Draw text: '{step.get('text', '')}'"
+        elif action == "draw_svg_path":
+            path = step.get('svg_path', '')
+            preview = path[:20] + "..." if len(path) > 20 else path
+            return f"Draw SVG Path: '{preview}'"
         elif action == "move_to":
             return f"Move brush to {step.get('position', '?')}"
         elif action == "new_sketch":

@@ -1,7 +1,13 @@
-"""Planner: Converts user prompts into structured art plans via LLM.
+"""Staged Planner: Converts user prompts into a 4-stage sculpting pipeline.
 
-Takes a natural language description and produces a JSON art plan
-that the executor can translate into Open Brush API commands.
+Pipeline:
+  Stage 1 — IDEAS:   Concept brief (plain text, no JSON)
+  Stage 2 — SKETCH:  Rough blocking with structural primitives
+  Stage 3 — OVERALL: Full composition drawing
+  Stage 4 — DETAILS: Polish pass — particles, glow, textures
+
+Each stage result is stored in session_memory and injected as context
+into all subsequent stages so the agent remembers what it planned.
 """
 
 import json
@@ -14,7 +20,6 @@ from .llm_client import LLMClient
 
 log = logging.getLogger("sculptor.planner")
 
-# Load system prompt from file
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
@@ -29,38 +34,34 @@ def _load_prompt(name: str) -> str:
 def _extract_json(text: str) -> dict[str, Any]:
     """Extract a JSON object from LLM response text.
 
-    Handles common formats:
+    Handles:
     - Pure JSON
     - JSON wrapped in ```json ... ``` markdown fences
     - JSON preceded/followed by prose text
-    - Empty or missing response
     """
     if not text or not text.strip():
-        raise ValueError("LLM returned an empty response. The model may not support this request.")
+        raise ValueError("LLM returned an empty response.")
 
     text = text.strip()
     log.debug("Raw LLM response (%d chars): %s", len(text), text[:300])
 
-    # 1. Try direct parse first
+    # 1. Try direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # 2. Try extracting from markdown code fences: ```json ... ``` or ``` ... ```
+    # 2. Try markdown code fences
     fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
     if fence_match:
         try:
-            extracted = fence_match.group(1).strip()
-            log.debug("Extracted from code fence: %s", extracted[:200])
-            return json.loads(extracted)
+            return json.loads(fence_match.group(1).strip())
         except json.JSONDecodeError:
             pass
 
-    # 3. Try finding a JSON object by matching outermost { ... }
+    # 3. Try outermost { ... } brace matching
     brace_start = text.find("{")
     if brace_start != -1:
-        # Find matching closing brace by counting depth
         depth = 0
         for i in range(brace_start, len(text)):
             if text[i] == "{":
@@ -68,14 +69,12 @@ def _extract_json(text: str) -> dict[str, Any]:
             elif text[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    candidate = text[brace_start : i + 1]
+                    candidate = text[brace_start: i + 1]
                     try:
-                        log.debug("Extracted by brace matching: %s", candidate[:200])
                         return json.loads(candidate)
                     except json.JSONDecodeError:
                         break
 
-    # Nothing worked
     raise ValueError(
         f"Could not extract JSON from LLM response.\n"
         f"Response ({len(text)} chars): {text[:500]}"
@@ -88,101 +87,258 @@ class ArtPlan:
     def __init__(self, data: dict[str, Any]):
         self.title: str = data.get("title", "Untitled")
         self.description: str = data.get("description", "")
+        self.stage: str = data.get("stage", "unknown")
         self.steps: list[dict[str, Any]] = data.get("steps", [])
+        # Optional spatial layout declared by the LLM
+        self.spatial_layout: list[dict[str, Any]] = data.get("spatial_layout", [])
         self.raw = data
 
     def __repr__(self):
-        return f"ArtPlan(title='{self.title}', steps={len(self.steps)})"
+        return f"ArtPlan(stage='{self.stage}', title='{self.title}', steps={len(self.steps)})"
 
     def summary(self) -> str:
         """Return a human-readable summary of the plan."""
         lines = [
-            f"🎨 {self.title}",
+            f"🎨 [{self.stage.upper()}] {self.title}",
             f"   {self.description}",
             f"   Steps: {len(self.steps)}",
         ]
-
-        # Count action types
         action_counts: dict[str, int] = {}
         for step in self.steps:
             action = step.get("action", "unknown")
             action_counts[action] = action_counts.get(action, 0) + 1
-
         for action, count in action_counts.items():
             lines.append(f"   - {action}: {count}x")
-
         return "\n".join(lines)
 
+    def step_summary(self) -> str:
+        """Short summary for injection into next stage context."""
+        action_counts: dict[str, int] = {}
+        for step in self.steps:
+            action = step.get("action", "unknown")
+            action_counts[action] = action_counts.get(action, 0) + 1
+        actions_str = ", ".join(f"{a}×{c}" for a, c in action_counts.items())
+        return (
+            f"Title: {self.title}\n"
+            f"Description: {self.description}\n"
+            f"Steps ({len(self.steps)} total): {actions_str}"
+        )
 
-class Planner:
-    """Converts user prompts into structured art plans using an LLM."""
+
+class StagedPlanner:
+    """4-stage creative pipeline for Open Brush sculpting.
+
+    Stages:
+      1. IDEAS   — concept brief (text)
+      2. SKETCH  — rough 3D blocking (JSON plan)
+      3. OVERALL — full composition drawing (JSON plan)
+      4. DETAILS — polish pass: particles, glow, textures (JSON plan)
+
+    Session memory is preserved across stages so each stage builds
+    on the accumulated context of all previous stages.
+    """
 
     def __init__(self, llm: LLMClient):
         self.llm = llm
-        self.system_prompt = _load_prompt("system")
+        self._prompts = {
+            "stage1": _load_prompt("stage1_ideas"),
+            "stage2": _load_prompt("stage2_sketch"),
+            "stage3": _load_prompt("stage3_overall"),
+            "stage4": _load_prompt("stage4_details"),
+        }
+        # Session memory — persists within a session, reset on /new or /reset
+        self.session_memory: dict[str, Any] = {}
+        # Flat conversation history for backward compat with /refine
         self.conversation_history: list[dict[str, str]] = []
-        log.info("Planner initialized, system prompt loaded (%d chars)", len(self.system_prompt))
+        log.info("StagedPlanner initialized")
 
-    def plan(self, user_prompt: str) -> ArtPlan:
-        """Generate an art plan from a user prompt.
+    # ── Internal helpers ───────────────────────────────────────────────────
 
-        Args:
-            user_prompt: Natural language description of desired art.
-
-        Returns:
-            ArtPlan with structured steps.
-
-        Raises:
-            ValueError: If LLM response is not valid JSON or missing required fields.
-        """
-        log.info("Planning for prompt: %s", user_prompt[:120])
-
+    def _chat(self, system_prompt: str, user_content: str, temperature: float = 0.7) -> str:
         messages = [
-            {"role": "system", "content": self.system_prompt},
-            *self.conversation_history,
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
         ]
-        log.debug("Sending %d messages to LLM (%d history)", len(messages), len(self.conversation_history))
+        log.debug("LLM call: %d chars system, %d chars user", len(system_prompt), len(user_content))
+        return self.llm.chat(messages, temperature=temperature)
 
-        response = self.llm.chat(messages, temperature=0.7)
-        log.info("LLM response received (%d chars)", len(response) if response else 0)
-        log.debug("LLM response: %s", response[:500] if response else "(empty)")
+    def _chat_plan_json(self, system_prompt: str, user_content: str, temperature: float = 0.7) -> str:
+        """Get JSON plan text with one retry path for empty/truncated responses."""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        log.debug("LLM JSON call: %d chars system, %d chars user", len(system_prompt), len(user_content))
 
-        # Parse JSON from response — handle various LLM output formats
+        # First attempt: ask provider for JSON mode output.
+        try:
+            response = self.llm.chat_json(messages, temperature=temperature)
+            if response and response.strip():
+                return response
+        except Exception as e:
+            log.warning("JSON-mode call failed, falling back to plain chat retry: %s", e)
+
+        # Fallback: force compact plain JSON only to reduce token pressure.
+        retry_user = (
+            f"{user_content}\n\n"
+            "IMPORTANT: Return ONLY a compact valid JSON object. "
+            "No markdown fences. No explanation."
+        )
+        return self._chat(system_prompt, retry_user, temperature=max(0.2, temperature - 0.1))
+
+    def _build_memory_context(self, include: list[str]) -> str:
+        """Build a context string from session memory for stage injection."""
+        parts = []
+        if "idea" in include and "idea" in self.session_memory:
+            parts.append("=== STAGE 1 — CONCEPT BRIEF ===\n" + self.session_memory["idea"])
+        if "sketch" in include and "sketch" in self.session_memory:
+            parts.append("=== STAGE 2 — ROUGH SKETCH SUMMARY ===\n" + self.session_memory["sketch"])
+        if "overall" in include and "overall" in self.session_memory:
+            parts.append("=== STAGE 3 — OVERALL DRAWING SUMMARY ===\n" + self.session_memory["overall"])
+        # Always inject spatial registry if it has entries
+        if self.session_memory.get("spatial_registry"):
+            registry_lines = []
+            for name, entry in self.session_memory["spatial_registry"].items():
+                pos = entry.get("position", [0, 0, 0])
+                facing = entry.get("facing", "none")
+                size = entry.get("size", "?")
+                layer = entry.get("layer", 0)
+                stage = entry.get("stage", "?")
+                registry_lines.append(
+                    f"  - {name}: pos={pos}, facing={facing}, size={size}, layer={layer} [placed in {stage}]"
+                )
+            parts.append(
+                "=== SPATIAL REGISTRY (what is placed where in 3D space) ===\n"
+                + "\n".join(registry_lines)
+            )
+        return "\n\n".join(parts)
+
+    def _merge_spatial_layout(self, plan: ArtPlan, stage_name: str):
+        """Merge a plan's spatial_layout entries into the persistent spatial registry."""
+        registry = self.session_memory.setdefault("spatial_registry", {})
+        for item in plan.spatial_layout:
+            name = item.get("name")
+            if not name:
+                continue
+            registry[name] = {
+                "position": item.get("position", [0, 0, 0]),
+                "facing": item.get("facing", "none"),
+                "size": item.get("size", "unknown"),
+                "layer": item.get("layer", 0),
+                "stage": stage_name,
+            }
+        log.debug("Spatial registry now has %d items", len(registry))
+
+    # ── 4-Stage pipeline ───────────────────────────────────────────────────
+
+    def stage1_ideate(self, user_prompt: str) -> str:
+        """Stage 1: Generate concept brief (plain text)."""
+        log.info("Stage 1 — Ideas for: %s", user_prompt[:80])
+        response = self._chat(self._prompts["stage1"], user_prompt, temperature=0.85)
+        self.session_memory["idea"] = response
+        self.session_memory["original_prompt"] = user_prompt
+        log.info("Stage 1 complete (%d chars)", len(response))
+        return response
+
+    def stage2_sketch(self) -> ArtPlan:
+        """Stage 2: Generate rough blocking plan."""
+        log.info("Stage 2 — Sketch/blocking")
+        context = self._build_memory_context(include=["idea"])
+        user_content = (
+            f"Original request: {self.session_memory.get('original_prompt', '')}\n\n"
+            f"{context}\n\n"
+            "Now produce the Stage 2 rough blocking JSON plan."
+        )
+        response = self._chat_plan_json(self._prompts["stage2"], user_content, temperature=0.6)
         data = _extract_json(response)
-        log.info("Parsed art plan: title=%s, steps=%d", data.get("title"), len(data.get("steps", [])))
+        plan = ArtPlan(data)
+        self._merge_spatial_layout(plan, stage_name="sketch")
+        self.session_memory["sketch"] = plan.step_summary()
+        log.info("Stage 2 complete: %s (%d steps)", plan.title, len(plan.steps))
+        return plan
 
-        if "steps" not in data:
-            raise ValueError(f"LLM response missing 'steps' field: {data}")
+    def stage3_overall(self) -> ArtPlan:
+        """Stage 3: Generate full composition drawing plan."""
+        log.info("Stage 3 — Overall drawing")
+        context = self._build_memory_context(include=["idea", "sketch"])
+        user_content = (
+            f"Original request: {self.session_memory.get('original_prompt', '')}\n\n"
+            f"{context}\n\n"
+            "Now produce the Stage 3 overall drawing JSON plan. "
+            "Build ON TOP of the sketch — do NOT clear the canvas."
+        )
+        response = self._chat_plan_json(self._prompts["stage3"], user_content, temperature=0.7)
+        data = _extract_json(response)
+        plan = ArtPlan(data)
+        self._merge_spatial_layout(plan, stage_name="overall")
+        self.session_memory["overall"] = plan.step_summary()
+        log.info("Stage 3 complete: %s (%d steps)", plan.title, len(plan.steps))
+        return plan
 
-        # Store in conversation history for context
+    def stage4_details(self) -> ArtPlan:
+        """Stage 4: Generate polish/detail pass plan."""
+        log.info("Stage 4 — Detail pass")
+        context = self._build_memory_context(include=["idea", "sketch", "overall"])
+        user_content = (
+            f"Original request: {self.session_memory.get('original_prompt', '')}\n\n"
+            f"{context}\n\n"
+            "Now produce the Stage 4 detail and polish JSON plan. "
+            "Add finishing touches — DO NOT redraw or clear anything."
+        )
+        response = self._chat_plan_json(self._prompts["stage4"], user_content, temperature=0.75)
+        data = _extract_json(response)
+        plan = ArtPlan(data)
+        self._merge_spatial_layout(plan, stage_name="details")
+        self.session_memory["details"] = plan.step_summary()
+        log.info("Stage 4 complete: %s (%d steps)", plan.title, len(plan.steps))
+        return plan
+
+    def run_pipeline(self, user_prompt: str) -> tuple[str, ArtPlan, ArtPlan, ArtPlan]:
+        """Run all 4 stages in sequence. Returns (concept, sketch, overall, details)."""
+        concept = self.stage1_ideate(user_prompt)
+        sketch = self.stage2_sketch()
+        overall = self.stage3_overall()
+        details = self.stage4_details()
+        # Store full history for /refine compatibility
         self.conversation_history.append({"role": "user", "content": user_prompt})
-        self.conversation_history.append({"role": "assistant", "content": response})
-
-        # Keep history manageable (last 10 exchanges)
+        self.conversation_history.append({"role": "assistant", "content": concept})
         if len(self.conversation_history) > 20:
             self.conversation_history = self.conversation_history[-20:]
+        return concept, sketch, overall, details
 
-        return ArtPlan(data)
+    # ── Refinement (single-shot, for /refine command) ──────────────────────
 
     def refine(self, feedback: str) -> ArtPlan:
-        """Refine the last art plan based on user feedback.
+        """Refine the last artwork with a single-shot LLM call.
 
-        Args:
-            feedback: User's feedback on what to change.
-
-        Returns:
-            Updated ArtPlan.
+        Uses full session memory as context so the LLM knows what drew.
         """
-        log.info("Refining with feedback: %s", feedback[:120])
-        refinement_prompt = (
-            f"The user wants to modify the artwork. Their feedback: {feedback}\n\n"
-            "Please output a complete updated JSON art plan incorporating their changes. "
-            "Keep what was good and modify what they asked for."
+        log.info("Refining with feedback: %s", feedback[:80])
+        system = _load_prompt("stage3_overall")  # reuse overall drawing prompt
+        context = self._build_memory_context(include=["idea", "sketch", "overall", "details"])
+        user_content = (
+            f"The user wants to refine the current artwork.\n"
+            f"Feedback: {feedback}\n\n"
+            f"Previous session context:\n{context}\n\n"
+            "Produce a JSON plan with ONLY the changes/additions needed. "
+            "Do NOT redraw existing elements unless the feedback requires it."
         )
-        return self.plan(refinement_prompt)
+        response = self._chat(system, user_content, temperature=0.7)
+        data = _extract_json(response)
+        plan = ArtPlan(data)
+        # Update overall summary with refinement
+        self.session_memory["overall"] = plan.step_summary() + " [refined]"
+        return plan
 
     def reset_history(self):
-        """Clear conversation history."""
+        """Clear all session memory and conversation history."""
+        self.session_memory.clear()
         self.conversation_history.clear()
-        log.info("Conversation history cleared")
+        log.info("Session memory and conversation history cleared")
+
+    # ── Backward-compat alias ──────────────────────────────────────────────
+
+    def plan(self, user_prompt: str) -> ArtPlan:
+        """Backward-compatible single-stage plan (runs full pipeline, returns details plan)."""
+        _, _, _, details = self.run_pipeline(user_prompt)
+        return details

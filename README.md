@@ -49,6 +49,11 @@ Or use environment variables:
 ```bash
 export OPENAI_API_KEY="sk-your-key"
 export OPENAI_BASE_URL="https://api.openai.com/v1"  # optional, default is OpenAI
+
+# Ollama Cloud example
+export OLLAMA_API_KEY="your-ollama-key"
+export OPENAI_BASE_URL="https://ollama.com/v1"
+export OPENAI_MODEL="glm-5"
 ```
 
 ### Run
@@ -128,8 +133,10 @@ See [config.example.yaml](config.example.yaml) for all options:
 llm:
   api_key: "sk-..."
   base_url: "https://api.openai.com/v1"
-  model: "gpt-4o"
+  model: "gemini-2.5-flash"
   temperature: 0.7
+  requests_per_minute: 5  # optional; auto-computes delay as 60/rpm
+  # call_delay: 12.0      # optional explicit override
 
 openbrush:
   host: "localhost"
@@ -140,6 +147,12 @@ export:
   auto_save: true
   auto_export: false
 ```
+
+Throttle options for rate limits:
+- `call_delay`: explicit seconds between calls (if <= 0 or missing, ignored)
+- `requests_per_minute`: converted to delay as `60 / rpm`
+
+If both are set, `call_delay` takes priority. If neither is set, there is no throttling.
 
 ## Examples
 

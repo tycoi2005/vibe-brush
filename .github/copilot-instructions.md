@@ -24,9 +24,9 @@
 - Smoke-test planner without full app flow: `python scripts/smoke_pipeline.py --stages 2`
 - Unit tests: `python -m unittest discover`
 - Targeted tests:
-  - `python -m unittest -v test_config.py`
-  - `python -m unittest -v test_llm_client.py`
-  - `python -m unittest -v test_planner.py`
+  - `python -m unittest -v tests/test_config.py`
+  - `python -m unittest -v tests/test_llm_client.py`
+  - `python -m unittest -v tests/test_planner.py`
 
 ## Conventions
 - Config sources and precedence are important: explicit `--config` path, then `SCULPTOR_CONFIG`, then local `config.yaml`, then user config path.

@@ -347,8 +347,7 @@ def _handle_export_and_copy(ob_client: OpenBrushClient, wait_time: int = 5):
 
             # Automatically convert JSON to OBJ if JSON exists
             try:
-                sys.path.append(str(Path(__file__).parent.parent))
-                from json_to_obj import convert_json_to_obj
+                from scripts.json_to_obj import convert_json_to_obj
                 json_files = list(dest.rglob("*.json")) if dest.is_dir() else ([dest] if dest.suffix == ".json" else [])
                 main_jsons = [jf for jf in json_files if not jf.name.endswith(".metadata.json")]
 

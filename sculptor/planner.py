@@ -48,16 +48,16 @@ def _extract_json(text: str) -> dict[str, Any]:
     # 1. Try direct parse
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    except json.JSONDecodeError as e:
+        log.debug("Direct JSON parse failed: %s (line=%s col=%s)", e.msg, e.lineno, e.colno)
 
     # 2. Try markdown code fences
     fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
     if fence_match:
         try:
             return json.loads(fence_match.group(1).strip())
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            log.debug("Fence JSON parse failed: %s (line=%s col=%s)", e.msg, e.lineno, e.colno)
 
     # 3. Try outermost { ... } brace matching
     brace_start = text.find("{")
@@ -72,8 +72,11 @@ def _extract_json(text: str) -> dict[str, Any]:
                     candidate = text[brace_start: i + 1]
                     try:
                         return json.loads(candidate)
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as e:
+                        log.debug("Brace-matched JSON parse failed: %s (line=%s col=%s)", e.msg, e.lineno, e.colno)
                         break
+
+    log.debug("Failed JSON response tail: %s", text[-300:])
 
     raise ValueError(
         f"Could not extract JSON from LLM response.\n"
@@ -162,29 +165,69 @@ class StagedPlanner:
         log.debug("LLM call: %d chars system, %d chars user", len(system_prompt), len(user_content))
         return self.llm.chat(messages, temperature=temperature)
 
-    def _chat_plan_json(self, system_prompt: str, user_content: str, temperature: float = 0.7) -> str:
-        """Get JSON plan text with one retry path for empty/truncated responses."""
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
+    def _generate_plan_data(self, stage_label: str, system_prompt: str, user_content: str, temperature: float = 0.7) -> dict[str, Any]:
+        """Generate and parse a stage JSON plan with retries for truncated outputs."""
+        log.debug("%s JSON generation start: %d chars system, %d chars user", stage_label, len(system_prompt), len(user_content))
+
+        attempts: list[tuple[str, str, float, bool]] = [
+            ("json_mode", user_content, temperature, True),
+            (
+                "plain_json_retry",
+                (
+                    f"{user_content}\n\n"
+                    "IMPORTANT: Return ONLY a valid JSON object. "
+                    "No markdown fences. No explanation."
+                ),
+                max(0.2, temperature - 0.1),
+                False,
+            ),
+            (
+                "compact_json_retry",
+                (
+                    f"{user_content}\n\n"
+                    "IMPORTANT: Return ONLY compact valid JSON with the schema title/description/stage/steps. "
+                    "Keep descriptions short to avoid truncation. No markdown fences."
+                ),
+                0.2,
+                False,
+            ),
         ]
-        log.debug("LLM JSON call: %d chars system, %d chars user", len(system_prompt), len(user_content))
 
-        # First attempt: ask provider for JSON mode output.
-        try:
-            response = self.llm.chat_json(messages, temperature=temperature)
-            if response and response.strip():
-                return response
-        except Exception as e:
-            log.warning("JSON-mode call failed, falling back to plain chat retry: %s", e)
+        last_error: Exception | None = None
+        for idx, (attempt_name, attempt_user, attempt_temp, use_json_mode) in enumerate(attempts, start=1):
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": attempt_user},
+            ]
+            log.info("%s attempt %d/%d: %s", stage_label, idx, len(attempts), attempt_name)
+            try:
+                if use_json_mode:
+                    response = self.llm.chat_json(messages, temperature=attempt_temp)
+                else:
+                    response = self.llm.chat(messages, temperature=attempt_temp)
 
-        # Fallback: force compact plain JSON only to reduce token pressure.
-        retry_user = (
-            f"{user_content}\n\n"
-            "IMPORTANT: Return ONLY a compact valid JSON object. "
-            "No markdown fences. No explanation."
-        )
-        return self._chat(system_prompt, retry_user, temperature=max(0.2, temperature - 0.1))
+                if not response or not response.strip():
+                    last_error = ValueError("LLM returned an empty response.")
+                    log.warning("%s attempt %d returned empty response", stage_label, idx)
+                    continue
+
+                try:
+                    return _extract_json(response)
+                except ValueError as e:
+                    last_error = e
+                    log.warning(
+                        "%s attempt %d JSON parse failed (%d chars): %s",
+                        stage_label,
+                        idx,
+                        len(response),
+                        e,
+                    )
+            except Exception as e:
+                last_error = e
+                log.warning("%s attempt %d request failed: %s", stage_label, idx, e)
+
+        assert last_error is not None
+        raise last_error
 
     def _build_memory_context(self, include: list[str]) -> str:
         """Build a context string from session memory for stage injection."""
@@ -249,8 +292,7 @@ class StagedPlanner:
             f"{context}\n\n"
             "Now produce the Stage 2 rough blocking JSON plan."
         )
-        response = self._chat_plan_json(self._prompts["stage2"], user_content, temperature=0.6)
-        data = _extract_json(response)
+        data = self._generate_plan_data("Stage 2", self._prompts["stage2"], user_content, temperature=0.6)
         plan = ArtPlan(data)
         self._merge_spatial_layout(plan, stage_name="sketch")
         self.session_memory["sketch"] = plan.step_summary()
@@ -267,8 +309,7 @@ class StagedPlanner:
             "Now produce the Stage 3 overall drawing JSON plan. "
             "Build ON TOP of the sketch — do NOT clear the canvas."
         )
-        response = self._chat_plan_json(self._prompts["stage3"], user_content, temperature=0.7)
-        data = _extract_json(response)
+        data = self._generate_plan_data("Stage 3", self._prompts["stage3"], user_content, temperature=0.7)
         plan = ArtPlan(data)
         self._merge_spatial_layout(plan, stage_name="overall")
         self.session_memory["overall"] = plan.step_summary()
@@ -285,8 +326,7 @@ class StagedPlanner:
             "Now produce the Stage 4 detail and polish JSON plan. "
             "Add finishing touches — DO NOT redraw or clear anything."
         )
-        response = self._chat_plan_json(self._prompts["stage4"], user_content, temperature=0.75)
-        data = _extract_json(response)
+        data = self._generate_plan_data("Stage 4", self._prompts["stage4"], user_content, temperature=0.75)
         plan = ArtPlan(data)
         self._merge_spatial_layout(plan, stage_name="details")
         self.session_memory["details"] = plan.step_summary()

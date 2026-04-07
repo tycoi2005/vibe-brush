@@ -92,8 +92,26 @@ class LLMClient:
             self._throttle_calls()
             response = self.client.chat.completions.create(**kwargs)
             content = response.choices[0].message.content or ""
-            log.info("LLM response: %d chars, finish_reason=%s", len(content), response.choices[0].finish_reason)
-            log.debug("LLM response preview: %s", content[:200])
+            finish_reason = response.choices[0].finish_reason
+            usage = getattr(response, "usage", None)
+            usage_prompt = getattr(usage, "prompt_tokens", None) if usage else None
+            usage_completion = getattr(usage, "completion_tokens", None) if usage else None
+            usage_total = getattr(usage, "total_tokens", None) if usage else None
+
+            log.info(
+                "LLM response: id=%s, %d chars, finish_reason=%s, usage(prompt=%s completion=%s total=%s)",
+                getattr(response, "id", "n/a"),
+                len(content),
+                finish_reason,
+                usage_prompt,
+                usage_completion,
+                usage_total,
+            )
+            log.debug("LLM response preview(head): %s", content[:200])
+            if len(content) > 200:
+                log.debug("LLM response preview(tail): %s", content[-200:])
+            if finish_reason == "length":
+                log.warning("LLM response was truncated by token limit (finish_reason=length)")
             return content
         except Exception as e:
             log.error("LLM API error: %s: %s", type(e).__name__, e)

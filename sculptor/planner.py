@@ -229,6 +229,68 @@ class StagedPlanner:
         assert last_error is not None
         raise last_error
 
+    def _generate_stage3_tasks(self, user_content: str) -> list[dict[str, str]]:
+        """Create a compact Stage 3 task list before generating full steps."""
+        system = (
+            "You are planning Stage 3 drawing work. "
+            "Return ONLY valid JSON with this schema: "
+            "{'tasks':[{'name':'...','goal':'...'}]}. "
+            "Create 3 to 6 tasks, concise and non-overlapping."
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ]
+
+        try:
+            raw = self.llm.chat_json(messages, temperature=0.3)
+            data = _extract_json(raw)
+            tasks = data.get("tasks", []) if isinstance(data, dict) else []
+            normalized: list[dict[str, str]] = []
+            for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                name = str(task.get("name", "")).strip()
+                goal = str(task.get("goal", "")).strip()
+                if not name:
+                    continue
+                normalized.append({"name": name, "goal": goal or name})
+            if normalized:
+                return normalized[:6]
+        except Exception as e:
+            log.warning("Stage 3 task-list generation failed, using fallback tasks: %s", e)
+
+        return [
+            {"name": "composition", "goal": "Lay out major forms and layers"},
+            {"name": "subject", "goal": "Draw the main subject with clear silhouette"},
+            {"name": "supporting", "goal": "Add supporting forms and depth layers"},
+            {"name": "lighting", "goal": "Apply key colors and lighting accents"},
+        ]
+
+    def _generate_stage3_task_plan(
+        self,
+        base_user_content: str,
+        task: dict[str, str],
+        task_index: int,
+        total_tasks: int,
+    ) -> dict[str, Any]:
+        """Generate one smaller Stage 3 partial plan for a specific task."""
+        task_user_content = (
+            f"{base_user_content}\n\n"
+            f"Current Stage 3 task {task_index}/{total_tasks}: {task['name']}\n"
+            f"Goal: {task['goal']}\n\n"
+            "IMPORTANT constraints for this partial output:\n"
+            "- Return only the steps needed for THIS task, not the entire artwork.\n"
+            "- Keep output concise. Target 8 to 20 steps max.\n"
+            "- Return ONLY valid JSON for one 'overall' plan object."
+        )
+        return self._generate_plan_data(
+            stage_label=f"Stage 3 Task {task_index}",
+            system_prompt=self._prompts["stage3"],
+            user_content=task_user_content,
+            temperature=0.6,
+        )
+
     def _build_memory_context(self, include: list[str]) -> str:
         """Build a context string from session memory for stage injection."""
         parts = []
@@ -309,7 +371,27 @@ class StagedPlanner:
             "Now produce the Stage 3 overall drawing JSON plan. "
             "Build ON TOP of the sketch — do NOT clear the canvas."
         )
-        data = self._generate_plan_data("Stage 3", self._prompts["stage3"], user_content, temperature=0.7)
+        tasks = self._generate_stage3_tasks(user_content)
+        log.info("Stage 3 task list generated: %d tasks", len(tasks))
+
+        merged_steps: list[dict[str, Any]] = []
+        description_parts: list[str] = []
+        for idx, task in enumerate(tasks, start=1):
+            log.info("Stage 3 executing task %d/%d: %s", idx, len(tasks), task["name"])
+            partial = self._generate_stage3_task_plan(user_content, task, idx, len(tasks))
+            partial_steps = partial.get("steps", []) if isinstance(partial, dict) else []
+            if isinstance(partial_steps, list):
+                merged_steps.extend(partial_steps)
+            partial_desc = str(partial.get("description", "")).strip() if isinstance(partial, dict) else ""
+            if partial_desc:
+                description_parts.append(partial_desc)
+
+        data = {
+            "title": "Stage 3 Overall Composition",
+            "description": "; ".join(description_parts[:3]) or "Combined Stage 3 plan from task chunks",
+            "stage": "overall",
+            "steps": merged_steps,
+        }
         plan = ArtPlan(data)
         self._merge_spatial_layout(plan, stage_name="overall")
         self.session_memory["overall"] = plan.step_summary()

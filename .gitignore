@@ -27,3 +27,5 @@ Thumbs.db
 config.yaml
 sculptor.log
 results/
+
+logs

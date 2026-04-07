@@ -7,6 +7,7 @@ and see them executed live in Open Brush.
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -398,10 +399,11 @@ def _execute_plan(plan, ob_client: OpenBrushClient, config: dict, stage_label: s
             console.print(f"    [dim red]{err}[/]")
 
 
-def setup_logging(debug: bool = False):
+def setup_logging(debug: bool = False) -> list[Path]:
     """Configure logging: always log to file, optionally verbose to console."""
     log_dir = Path(".")  # log file in current directory
     log_file = log_dir / "sculptor.log"
+    log_files: list[Path] = [log_file]
 
     # Root sculptor logger
     logger = logging.getLogger("sculptor")
@@ -416,6 +418,21 @@ def setup_logging(debug: bool = False):
     ))
     logger.addHandler(fh)
 
+    # When debug mode is enabled, also create a per-run runtime log file.
+    if debug:
+        runtime_log_dir = Path("logs")
+        runtime_log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H-%M-%S")
+        runtime_log_file = runtime_log_dir / f"runtime-log-{timestamp}.log"
+        rfh = logging.FileHandler(runtime_log_file, mode="w", encoding="utf-8")
+        rfh.setLevel(logging.DEBUG)
+        rfh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logger.addHandler(rfh)
+        log_files.append(runtime_log_file)
+
     # Console handler — INFO or DEBUG depending on flag
     ch = logging.StreamHandler(sys.stderr)
     ch.setLevel(logging.DEBUG if debug else logging.WARNING)
@@ -425,8 +442,10 @@ def setup_logging(debug: bool = False):
     logger.info("=" * 60)
     logger.info("Sculptor session started (debug=%s)", debug)
     logger.info("Log file: %s", log_file.resolve())
+    if debug and len(log_files) > 1:
+        logger.info("Runtime log file: %s", log_files[1].resolve())
 
-    return log_file
+    return log_files
 
 
 def main():
@@ -442,8 +461,10 @@ def main():
     args = parser.parse_args()
 
     # Setup logging before anything else
-    log_file = setup_logging(debug=args.debug)
-    console.print(f"  [dim]📝 Log file: {log_file.resolve()}[/]")
+    log_files = setup_logging(debug=args.debug)
+    console.print(f"  [dim]📝 Log file: {log_files[0].resolve()}[/]")
+    if args.debug and len(log_files) > 1:
+        console.print(f"  [dim]📝 Runtime log: {log_files[1].resolve()}[/]")
     if args.prompt:
         # Non-interactive mode
         config = load_config(args.config)

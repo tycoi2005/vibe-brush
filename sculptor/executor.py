@@ -6,6 +6,7 @@ Open Brush instance via the HTTP API.
 
 import logging
 import time
+from copy import deepcopy
 
 log = logging.getLogger("sculptor.executor")
 from typing import Any, Callable
@@ -63,7 +64,8 @@ class Executor:
         }
 
         for i, step in enumerate(plan.steps):
-            action = step.get("action", "unknown")
+            normalized_step = self._normalize_step(step)
+            action = normalized_step.get("action", "unknown")
             desc = self._describe_step(step)
 
             if self.on_step:
@@ -71,7 +73,7 @@ class Executor:
 
             try:
                 log.debug("Executing step %d/%d: %s", i + 1, total, desc)
-                paths_drawn = self._execute_step(step)
+                paths_drawn = self._execute_step(normalized_step)
                 results["completed"] += 1
                 results["paths_drawn"] += paths_drawn
                 log.debug("Step %d complete, %d paths drawn", i + 1, paths_drawn)
@@ -84,6 +86,71 @@ class Executor:
                 results["errors"].append(error_msg)
 
         return results
+
+    def _normalize_step(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Normalize loosely structured LLM steps into executor-compatible schema."""
+        s = deepcopy(step)
+
+        # Expand one-key shorthand objects used by some model outputs.
+        if "action" not in s and len(s) == 1:
+            key, value = next(iter(s.items()))
+            if key == "set_brush_size":
+                s = {"action": "set_brush", "size": value}
+            elif key == "set_color_html":
+                s = {"action": "set_color_html", "color": value}
+            elif key == "set_color_rgb":
+                s = {"action": "set_color", "rgb": value}
+            elif key == "set_color_hsv":
+                s = {"action": "set_color_hsv", "hsv": value}
+            elif key in ("draw_shape", "draw_path", "draw_svg_path") and isinstance(value, dict):
+                s = {"action": key, **value}
+
+        # Normalize common brush key variants.
+        if s.get("action") == "set_brush":
+            if "type" not in s:
+                s["type"] = s.get("brush") or s.get("name") or "ink"
+
+        # Normalize common color key variants.
+        if s.get("action") == "set_color_html":
+            color_value = s.get("color") or s.get("html") or s.get("hex") or s.get("value")
+            if color_value:
+                s["color"] = color_value
+
+        # Normalize draw_path variants.
+        if s.get("action") == "draw_path":
+            if "points" not in s and "path" in s:
+                s["points"] = s.get("path")
+
+        # Normalize draw_shape variants.
+        if s.get("action") == "draw_shape":
+            if "shape" not in s and "type" in s:
+                s["shape"] = s.get("type")
+
+            shape_aliases = {
+                "sphere": "sphere_wireframe",
+                "cone": "cone_wireframe",
+                "cylinder": "cylinder_wireframe",
+                "cube": "cube_wireframe",
+            }
+            if isinstance(s.get("shape"), str):
+                s["shape"] = shape_aliases.get(s["shape"], s["shape"])
+
+            # Most primitives are centered; convert position -> center.
+            if "center" not in s and "position" in s:
+                s["center"] = s.get("position")
+
+            # line primitive expects start/end points.
+            if s.get("shape") == "line":
+                if "start" not in s and "position" in s:
+                    s["start"] = s.get("position")
+                if "end" not in s and "position_end" in s:
+                    s["end"] = s.get("position_end")
+                if "end" not in s and "start" in s and "size" in s:
+                    start = s.get("start")
+                    if isinstance(start, list) and len(start) == 3:
+                        s["end"] = [start[0], start[1] + float(s.get("size", 0.1)), start[2]]
+
+        return s
 
     def _execute_step(self, step: dict[str, Any]) -> int:
         """Execute a single step. Returns number of paths drawn."""
@@ -239,6 +306,7 @@ class Executor:
 
     def _describe_step(self, step: dict[str, Any]) -> str:
         """Return a short human-readable description of a step."""
+        step = self._normalize_step(step)
         action = step.get("action", "unknown")
 
         if action == "set_brush":
